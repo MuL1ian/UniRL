@@ -274,6 +274,15 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
                     if step_eta > 0.0 and denoise_seed_keys is not None
                     else None
                 )
+                audio_step_generators = (
+                    make_denoise_step_generators(
+                        base_seed=int(denoise_base_seed),
+                        step_index=step_idx,
+                        sample_ids=[f"{key}::audio" for key in denoise_seed_keys],
+                    )
+                    if step_eta > 0.0 and self._audio_in_policy and denoise_seed_keys is not None
+                    else None
+                )
 
                 video_pred, audio_pred = self.step_kernel.predict_noise(
                     self.bundle,
@@ -307,6 +316,7 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
                     sigma=sigma,
                     sigma_next=sigma_next,
                     eta=audio_eta,
+                    generator=audio_step_generators,
                     sigma_max=sigma_max,
                     step_index=step_idx,
                 )

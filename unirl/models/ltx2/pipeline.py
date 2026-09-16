@@ -227,6 +227,7 @@ class LTX2Pipeline(Pipeline):
         )
 
         sde_indices = list(params.sde_indices) if params.sde_indices is not None else None
+        denoise_seed_keys = list(frontier.init_noise_group_ids or frontier.sample_ids)
         segment = self.diffusion.generate(
             conditions,
             params=params,
@@ -234,7 +235,7 @@ class LTX2Pipeline(Pipeline):
             initial_latents=initial_latents,
             initial_audio_latents=initial_audio_latents,
             sde_indices=sde_indices,
-            denoise_seed_keys=[str(sample_id) for sample_id in frontier.sample_ids],
+            denoise_seed_keys=[str(seed_key) for seed_key in denoise_seed_keys],
             denoise_base_seed=int(params.seed) if params.seed is not None else 0,
         )
 

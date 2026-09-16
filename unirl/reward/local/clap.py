@@ -43,7 +43,6 @@ class CLAPRewardScorer(LocalRewardBackend):
     def _preprocess_audio(self, audio_list: List[torch.Tensor], src_sample_rate: int) -> List["torch.Tensor"]:
         """Downmix and resample each ``[L]`` / ``[C, L]`` / ``[L, C]`` waveform to CLAP's 48 kHz mono ``[L']``."""
         import numpy as np
-        import torchaudio.functional as AF
 
         processed: List[np.ndarray] = []
         for waveform in audio_list:
@@ -56,6 +55,8 @@ class CLAPRewardScorer(LocalRewardBackend):
             wf = wf.reshape(-1)
 
             if src_sample_rate != self.CLAP_SAMPLE_RATE:
+                import torchaudio.functional as AF
+
                 wf = AF.resample(
                     wf.unsqueeze(0),
                     orig_freq=int(src_sample_rate),

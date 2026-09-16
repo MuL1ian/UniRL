@@ -126,9 +126,7 @@ class LTX2Bundle(Bundle):
                 if vocoder_cls is None:
                     raise ValueError(f"LTX2Bundle: unsupported vocoder class {vocoder_class_name!r}.")
                 vocoder = (
-                    vocoder_cls.from_pretrained(
-                        path, subfolder="vocoder", torch_dtype=dtype, low_cpu_mem_usage=False
-                    )
+                    vocoder_cls.from_pretrained(path, subfolder="vocoder", torch_dtype=dtype, low_cpu_mem_usage=False)
                     .to(device)
                     .eval()
                 )

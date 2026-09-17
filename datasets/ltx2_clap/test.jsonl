@@ -1,0 +1,8 @@
+{"prompt":"A watchdog gives a series of unmistakable loud barks outside.","metadata":{"audio_caption":"The sound of a dog barking.","audio_class":"dog"}}
+{"prompt":"A lightning storm is accompanied by a deep booming thunder roll.","metadata":{"audio_caption":"The sound of thunder.","audio_class":"thunderstorm"}}
+{"prompt":"Surf breaks repeatedly on the coastline with audible crashing waves.","metadata":{"audio_caption":"The sound of ocean waves.","audio_class":"sea_waves"}}
+{"prompt":"A seated crowd responds with prolonged clapping and applause.","metadata":{"audio_caption":"The sound of applause and clapping.","audio_class":"clapping"}}
+{"prompt":"The warning siren of a passing ambulance alternates in pitch.","metadata":{"audio_caption":"The sound of an ambulance siren.","audio_class":"siren"}}
+{"prompt":"Resonant bells toll from the tower of an old church.","metadata":{"audio_caption":"The sound of church bells ringing.","audio_class":"church_bells"}}
+{"prompt":"Clear musical strums are played on a steel-string acoustic guitar.","metadata":{"audio_caption":"The sound of an acoustic guitar being strummed.","audio_class":"acoustic_guitar"}}
+{"prompt":"The distinct sound of an infant crying fills the room.","metadata":{"audio_caption":"The sound of a baby crying.","audio_class":"crying_baby"}}

@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List
+import inspect
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
 
 from unirl.reward.base import BaseRewardComponentSpec
 from unirl.reward.local.device import resolve_device
-from unirl.types.reward import RewardRequest
+from unirl.types.reward import RewardRequest, RewardResponse
 
 from .base import LocalRewardBackend
 
@@ -23,6 +25,15 @@ class CLAPRewardScorer(LocalRewardBackend):
     CLAP_SAMPLE_RATE = 48_000
 
     def __init__(self, *, config: "CLAPSpec", base_device: str) -> None:
+        self.prompt_metadata_key = str(config.prompt_metadata_key or "").strip() or None
+        self.retrieval_prompts = [str(prompt).strip() for prompt in config.retrieval_prompts]
+        if any(not prompt for prompt in self.retrieval_prompts):
+            raise ValueError("CLAPSpec.retrieval_prompts must contain only non-empty strings.")
+        if len(set(self.retrieval_prompts)) != len(self.retrieval_prompts):
+            raise ValueError("CLAPSpec.retrieval_prompts must not contain duplicates.")
+        if self.retrieval_prompts and len(self.retrieval_prompts) < 2:
+            raise ValueError("CLAPSpec.retrieval_prompts needs at least two prompts for retrieval diagnostics.")
+        self._retrieval_text_embeds: Optional[torch.Tensor] = None
         super().__init__(
             device=resolve_device(config.device, base_device),
             batch_size=config.batch_size,
@@ -39,6 +50,9 @@ class CLAPRewardScorer(LocalRewardBackend):
         self.model = ClapModel.from_pretrained(model_id).to(self.device).eval()
         self.model = self.model.to(dtype=torch.float32)
         self.processor = ClapProcessor.from_pretrained(model_id)
+        self._processor_audio_keyword = (
+            "audio" if "audio" in inspect.signature(self.processor.__call__).parameters else "audios"
+        )
 
     def _preprocess_audio(self, audio_list: List[torch.Tensor], src_sample_rate: int) -> List["torch.Tensor"]:
         """Downmix and resample each ``[L]`` / ``[C, L]`` / ``[L, C]`` waveform to CLAP's 48 kHz mono ``[L']``."""
@@ -66,9 +80,82 @@ class CLAPRewardScorer(LocalRewardBackend):
             processed.append(wf.cpu().numpy())
         return processed
 
-    def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
-        audio = request.audio
+    @staticmethod
+    def _feature_tensor(value: Any) -> torch.Tensor:
+        """Normalize the tensor/wrapper return types used across transformers releases."""
+        if torch.is_tensor(value):
+            return value
+        pooled = getattr(value, "pooler_output", None)
+        if torch.is_tensor(pooled):
+            return pooled
+        if isinstance(value, tuple) and value and torch.is_tensor(value[0]):
+            return value[0]
+        raise TypeError(f"Cannot extract CLAP feature tensor from {type(value).__name__}.")
+
+    def _encode_texts(self, prompts: List[str]) -> torch.Tensor:
+        inputs = self.processor(text=prompts, return_tensors="pt", padding=True)
+        inputs = {key: value.to(self.device) for key, value in inputs.items()}
+        with torch.no_grad():
+            features = self.model.get_text_features(
+                input_ids=inputs.get("input_ids"),
+                attention_mask=inputs.get("attention_mask"),
+            )
+        return F.normalize(self._feature_tensor(features).float(), p=2, dim=-1)
+
+    def _encode_audio(self, waveforms: List[torch.Tensor], src_sample_rate: int) -> torch.Tensor:
+        waveforms_np = self._preprocess_audio(waveforms, src_sample_rate)
+        inputs = self.processor(
+            **{self._processor_audio_keyword: waveforms_np},
+            sampling_rate=self.CLAP_SAMPLE_RATE,
+            return_tensors="pt",
+            padding=True,
+        )
+        inputs = {key: value.to(self.device) for key, value in inputs.items()}
+        with torch.no_grad():
+            features = self.model.get_audio_features(
+                input_features=inputs.get("input_features"),
+                is_longer=inputs.get("is_longer"),
+                attention_mask=inputs.get("attention_mask"),
+            )
+        return F.normalize(self._feature_tensor(features).float(), p=2, dim=-1)
+
+    def _reward_prompts(self, request: RewardRequest) -> List[str]:
         prompts = request.prompts
+        if self.prompt_metadata_key is None:
+            return prompts
+
+        metadata = request.metadata or []
+        resolved: List[str] = []
+        for index, prompt in enumerate(prompts):
+            row = metadata[index] if index < len(metadata) else None
+            candidate = row.get(self.prompt_metadata_key) if isinstance(row, dict) else None
+            resolved.append(candidate.strip() if isinstance(candidate, str) and candidate.strip() else prompt)
+        return resolved
+
+    def compute_rewards(self, request: RewardRequest) -> RewardResponse:
+        """Score matched captions and expose optional fixed-vocabulary retrieval diagnostics."""
+        if not self._is_loaded:
+            raise RuntimeError(
+                f"{type(self).__name__}.compute_rewards called before _load_model "
+                f"completed (model_name={self.model_name!r}, batch_size={request.batch_size})."
+            )
+        start = time.time()
+        rewards, components = self._compute_rewards_and_components(request)
+        return RewardResponse(
+            rewards=rewards,
+            component_rewards=components,
+            successes=[True] * len(rewards),
+            errors=[None] * len(rewards),
+            compute_time=time.time() - start,
+        )
+
+    def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
+        rewards, _ = self._compute_rewards_and_components(request)
+        return rewards
+
+    def _compute_rewards_and_components(self, request: RewardRequest) -> tuple[List[float], Dict[str, List[float]]]:
+        audio = request.audio
+        prompts = self._reward_prompts(request)
         if audio is None:
             raise ValueError(
                 "CLAPRewardScorer requires audio in the reward request "
@@ -77,35 +164,75 @@ class CLAPRewardScorer(LocalRewardBackend):
             )
         if request.audio_sample_rate is None:
             raise ValueError("CLAPRewardScorer requires request.audio_sample_rate (source Hz); got None.")
+        if len(audio) != len(prompts):
+            raise ValueError(f"CLAPRewardScorer got {len(audio)} audio samples but {len(prompts)} reward prompts.")
         src_rate = int(request.audio_sample_rate)
 
         all_rewards: List[float] = []
+        component_rewards: Dict[str, List[float]] = {"matched_cosine": []}
+        retrieval_prompt_to_index = {prompt: index for index, prompt in enumerate(self.retrieval_prompts)}
+        if self.retrieval_prompts:
+            component_rewards.update(
+                {
+                    "mismatched_cosine": [],
+                    "retrieval_margin": [],
+                    "retrieval_top1": [],
+                }
+            )
+            unknown = sorted(set(prompts) - set(retrieval_prompt_to_index))
+            if unknown:
+                raise ValueError(
+                    "CLAP reward prompts must appear in CLAPSpec.retrieval_prompts when retrieval diagnostics "
+                    f"are enabled; missing={unknown[:3]!r}."
+                )
+
         for i in range(0, len(audio), self.batch_size):
             batch_audio = audio[i : i + self.batch_size]
             batch_prompts = prompts[i : i + self.batch_size]
-            waveforms_np = self._preprocess_audio(batch_audio, src_rate)
+            audio_embeds = self._encode_audio(batch_audio, src_rate)
 
-            inputs = self.processor(
-                text=batch_prompts,
-                # `audios=` was deprecated and is now rejected outright by
-                # ClapProcessor (transformers 5.x): "You passed keyword argument
-                # `audios` which is deprecated. Please use `audio` instead."
-                # It surfaces as every sample failing scoring, not as a crash.
-                audio=waveforms_np,
-                sampling_rate=self.CLAP_SAMPLE_RATE,
-                return_tensors="pt",
-                padding=True,
-            )
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            if not self.retrieval_prompts:
+                text_embeds = self._encode_texts(batch_prompts)
+                matched = (audio_embeds * text_embeds).sum(dim=-1)
+            else:
+                score_matrix = audio_embeds @ self._get_retrieval_text_embeds().T
+                target_indices = torch.tensor(
+                    [retrieval_prompt_to_index[prompt] for prompt in batch_prompts],
+                    device=score_matrix.device,
+                    dtype=torch.long,
+                )
+                rows = torch.arange(score_matrix.shape[0], device=score_matrix.device)
+                matched = score_matrix[rows, target_indices]
+                negative_mask = torch.ones_like(score_matrix, dtype=torch.bool)
+                negative_mask[rows, target_indices] = False
+                negative_scores = score_matrix[negative_mask].view(score_matrix.shape[0], -1)
+                mismatched = negative_scores.mean(dim=-1)
+                margin = matched - negative_scores.max(dim=-1).values
+                top1 = (score_matrix.argmax(dim=-1) == target_indices).float()
+                component_rewards["mismatched_cosine"].extend(mismatched.float().cpu().tolist())
+                component_rewards["retrieval_margin"].extend(margin.float().cpu().tolist())
+                component_rewards["retrieval_top1"].extend(top1.cpu().tolist())
 
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-                audio_embeds = F.normalize(outputs.audio_embeds, p=2, dim=-1)
-                text_embeds = F.normalize(outputs.text_embeds, p=2, dim=-1)
-                scores = (audio_embeds * text_embeds).sum(dim=-1)
-            all_rewards.extend(scores.float().cpu().tolist())
+            matched_values = matched.float().cpu().tolist()
+            all_rewards.extend(matched_values)
+            component_rewards["matched_cosine"].extend(matched_values)
 
-        return all_rewards
+        return all_rewards, component_rewards
+
+    def _get_retrieval_text_embeds(self) -> torch.Tensor:
+        if self._retrieval_text_embeds is None:
+            self._retrieval_text_embeds = self._encode_texts(self.retrieval_prompts)
+        return self._retrieval_text_embeds
+
+    def offload(self) -> None:
+        super().offload()
+        if self._retrieval_text_embeds is not None:
+            self._retrieval_text_embeds = self._retrieval_text_embeds.cpu()
+
+    def onload(self) -> None:
+        super().onload()
+        if self._retrieval_text_embeds is not None:
+            self._retrieval_text_embeds = self._retrieval_text_embeds.to(self.device)
 
 
 @dataclass
@@ -115,3 +242,5 @@ class CLAPSpec(BaseRewardComponentSpec):
     batch_size: int = 8
     device: str = "auto"
     model_id: str = "laion/larger_clap_general"
+    prompt_metadata_key: Optional[str] = None
+    retrieval_prompts: List[str] = field(default_factory=list)

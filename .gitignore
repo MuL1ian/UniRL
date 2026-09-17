@@ -95,7 +95,7 @@ datasets/**
 !datasets/ocr/*.txt
 !datasets/pickscore/*.txt
 !datasets/refl_videoalign/*.txt
-!datasets/ltx2_clap/*.txt
+!datasets/ltx2_clap/*.jsonl
 
 # Downloaded snapshots and cooked outputs, whatever they happen to contain --
 # last, so the code re-includes above do not reach inside them.

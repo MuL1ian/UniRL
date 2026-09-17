@@ -2,9 +2,10 @@
 # LTX-Video-2.3 T2AV Flow-GRPO with audio-text reward only.
 #
 # The generated video remains the primary rollout output, while CLAP reads the
-# decoded audio waveform carried alongside it in the reward request.
-# Validated on 8 H20 GPUs: the first/last 20-rollout reward mean improved from
-# 0.0275 to 0.0540 over the 100-rollout default run.
+# decoded audio waveform carried alongside it in the reward request. Generation
+# uses the visual prompt; CLAP uses metadata.audio_caption with a fixed 8-class
+# retrieval vocabulary so matched cosine, mismatched cosine, margin, and top-1
+# accuracy can be monitored together.
 #
 # Launch (1 node x 8 GPUs):
 #   bash examples/run_experiment_single_node.sh diffusion/ltx2/ltx2_3_t2av_clap_trainside
@@ -47,7 +48,7 @@ bundle:
     audio_joint_sde: true
     default_height: 512
     default_width: 768
-    default_num_frames: 33
+    default_num_frames: 49
     default_frame_rate: 24.0
 
 pipeline:
@@ -120,6 +121,16 @@ reward:
       _target_: unirl.reward.local.clap.CLAPSpec
       batch_size: 2
       device: auto
+      prompt_metadata_key: audio_caption
+      retrieval_prompts:
+        - The sound of a dog barking.
+        - The sound of thunder.
+        - The sound of ocean waves.
+        - The sound of applause and clapping.
+        - The sound of an ambulance siren.
+        - The sound of church bells ringing.
+        - The sound of an acoustic guitar being strummed.
+        - The sound of a baby crying.
 
 algorithm:
   _target_: unirl.algorithms.flowgrpo.FlowGRPO
@@ -142,8 +153,8 @@ data_source:
   _target_: unirl.data.data_source.MultimodalRLDataSource
   args:
     run:
-      data_path: datasets/ltx2_clap/train.txt
-      eval_data_path: datasets/ltx2_clap/test.txt
+      data_path: datasets/ltx2_clap/train.jsonl
+      eval_data_path: datasets/ltx2_clap/test.jsonl
       seed: 42
       shuffle: false
     algorithm:
@@ -151,11 +162,11 @@ data_source:
 
 sampling:
   _target_: unirl.types.sampling.DiffusionSamplingParams
-  num_inference_steps: 2
+  num_inference_steps: 4
   guidance_scale: 1.0
   height: 256
   width: 384
-  num_frames: 17
+  num_frames: 49
   eta: 0.7
   samples_per_prompt: 4
   seed: 42
@@ -166,5 +177,5 @@ sampling:
   scheduler:
     _target_: unirl.sde.index_schedule.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
-    num_sde_steps: 1
+    num_sde_steps: 2
     timestep_fraction: [0, 0.5]

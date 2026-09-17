@@ -26,6 +26,7 @@ class CLAPRewardScorer(LocalRewardBackend):
 
     def __init__(self, *, config: "CLAPSpec", base_device: str) -> None:
         self.prompt_metadata_key = str(config.prompt_metadata_key or "").strip() or None
+        self.negative_prompts_metadata_key = str(config.negative_prompts_metadata_key or "").strip() or None
         self.retrieval_prompts = [str(prompt).strip() for prompt in config.retrieval_prompts]
         if any(not prompt for prompt in self.retrieval_prompts):
             raise ValueError("CLAPSpec.retrieval_prompts must contain only non-empty strings.")
@@ -33,6 +34,8 @@ class CLAPRewardScorer(LocalRewardBackend):
             raise ValueError("CLAPSpec.retrieval_prompts must not contain duplicates.")
         if self.retrieval_prompts and len(self.retrieval_prompts) < 2:
             raise ValueError("CLAPSpec.retrieval_prompts needs at least two prompts for retrieval diagnostics.")
+        if self.retrieval_prompts and self.negative_prompts_metadata_key:
+            raise ValueError("CLAPSpec.retrieval_prompts and negative_prompts_metadata_key are mutually exclusive.")
         self._retrieval_text_embeds: Optional[torch.Tensor] = None
         super().__init__(
             device=resolve_device(config.device, base_device),
@@ -132,8 +135,37 @@ class CLAPRewardScorer(LocalRewardBackend):
             resolved.append(candidate.strip() if isinstance(candidate, str) and candidate.strip() else prompt)
         return resolved
 
+    def _negative_prompts(self, request: RewardRequest, reward_prompts: List[str]) -> Optional[List[List[str]]]:
+        if self.negative_prompts_metadata_key is None:
+            return None
+
+        metadata = request.metadata or []
+        resolved: List[List[str]] = []
+        for index, target_prompt in enumerate(reward_prompts):
+            row = metadata[index] if index < len(metadata) else None
+            candidates = row.get(self.negative_prompts_metadata_key) if isinstance(row, dict) else None
+            if not isinstance(candidates, (list, tuple)):
+                raise ValueError(
+                    "CLAP negative prompt metadata must be a list of strings; "
+                    f"key={self.negative_prompts_metadata_key!r}, sample_index={index}."
+                )
+            negatives = list(
+                dict.fromkeys(
+                    candidate.strip()
+                    for candidate in candidates
+                    if isinstance(candidate, str) and candidate.strip() and candidate.strip() != target_prompt
+                )
+            )
+            if not negatives:
+                raise ValueError(
+                    "CLAP negative prompt metadata must contain at least one non-target caption; "
+                    f"key={self.negative_prompts_metadata_key!r}, sample_index={index}."
+                )
+            resolved.append(negatives)
+        return resolved
+
     def compute_rewards(self, request: RewardRequest) -> RewardResponse:
-        """Score matched captions and expose optional fixed-vocabulary retrieval diagnostics."""
+        """Score matched captions and expose optional retrieval diagnostics."""
         if not self._is_loaded:
             raise RuntimeError(
                 f"{type(self).__name__}.compute_rewards called before _load_model "
@@ -167,11 +199,21 @@ class CLAPRewardScorer(LocalRewardBackend):
         if len(audio) != len(prompts):
             raise ValueError(f"CLAPRewardScorer got {len(audio)} audio samples but {len(prompts)} reward prompts.")
         src_rate = int(request.audio_sample_rate)
+        negative_prompt_sets = self._negative_prompts(request, prompts)
+        dynamic_text_embeds: Optional[torch.Tensor] = None
+        dynamic_prompt_to_index: Dict[str, int] = {}
+        if not self.retrieval_prompts:
+            dynamic_prompts = list(prompts)
+            if negative_prompt_sets is not None:
+                dynamic_prompts.extend(prompt for row in negative_prompt_sets for prompt in row)
+            unique_dynamic_prompts = list(dict.fromkeys(dynamic_prompts))
+            dynamic_text_embeds = self._encode_texts(unique_dynamic_prompts)
+            dynamic_prompt_to_index = {prompt: index for index, prompt in enumerate(unique_dynamic_prompts)}
 
         all_rewards: List[float] = []
         component_rewards: Dict[str, List[float]] = {"matched_cosine": []}
         retrieval_prompt_to_index = {prompt: index for index, prompt in enumerate(self.retrieval_prompts)}
-        if self.retrieval_prompts:
+        if self.retrieval_prompts or negative_prompt_sets is not None:
             component_rewards.update(
                 {
                     "mismatched_cosine": [],
@@ -179,6 +221,7 @@ class CLAPRewardScorer(LocalRewardBackend):
                     "retrieval_top1": [],
                 }
             )
+        if self.retrieval_prompts:
             unknown = sorted(set(prompts) - set(retrieval_prompt_to_index))
             if unknown:
                 raise ValueError(
@@ -191,10 +234,7 @@ class CLAPRewardScorer(LocalRewardBackend):
             batch_prompts = prompts[i : i + self.batch_size]
             audio_embeds = self._encode_audio(batch_audio, src_rate)
 
-            if not self.retrieval_prompts:
-                text_embeds = self._encode_texts(batch_prompts)
-                matched = (audio_embeds * text_embeds).sum(dim=-1)
-            else:
+            if self.retrieval_prompts:
                 score_matrix = audio_embeds @ self._get_retrieval_text_embeds().T
                 target_indices = torch.tensor(
                     [retrieval_prompt_to_index[prompt] for prompt in batch_prompts],
@@ -209,6 +249,43 @@ class CLAPRewardScorer(LocalRewardBackend):
                 mismatched = negative_scores.mean(dim=-1)
                 margin = matched - negative_scores.max(dim=-1).values
                 top1 = (score_matrix.argmax(dim=-1) == target_indices).float()
+            elif negative_prompt_sets is not None:
+                assert dynamic_text_embeds is not None
+                target_indices = torch.tensor(
+                    [dynamic_prompt_to_index[prompt] for prompt in batch_prompts],
+                    device=dynamic_text_embeds.device,
+                    dtype=torch.long,
+                )
+                text_embeds = dynamic_text_embeds.index_select(0, target_indices)
+                matched = (audio_embeds * text_embeds).sum(dim=-1)
+                batch_negative_prompts = negative_prompt_sets[i : i + self.batch_size]
+                mismatched_values = []
+                hardest_negative_values = []
+                for row_index, row_prompts in enumerate(batch_negative_prompts):
+                    indices = torch.tensor(
+                        [dynamic_prompt_to_index[prompt] for prompt in row_prompts],
+                        device=dynamic_text_embeds.device,
+                        dtype=torch.long,
+                    )
+                    row_negative_embeds = dynamic_text_embeds.index_select(0, indices)
+                    row_negative_scores = row_negative_embeds @ audio_embeds[row_index]
+                    mismatched_values.append(row_negative_scores.mean())
+                    hardest_negative_values.append(row_negative_scores.max())
+                mismatched = torch.stack(mismatched_values)
+                hardest_negative = torch.stack(hardest_negative_values)
+                margin = matched - hardest_negative
+                top1 = (matched > hardest_negative).float()
+            else:
+                assert dynamic_text_embeds is not None
+                target_indices = torch.tensor(
+                    [dynamic_prompt_to_index[prompt] for prompt in batch_prompts],
+                    device=dynamic_text_embeds.device,
+                    dtype=torch.long,
+                )
+                text_embeds = dynamic_text_embeds.index_select(0, target_indices)
+                matched = (audio_embeds * text_embeds).sum(dim=-1)
+
+            if self.retrieval_prompts or negative_prompt_sets is not None:
                 component_rewards["mismatched_cosine"].extend(mismatched.float().cpu().tolist())
                 component_rewards["retrieval_margin"].extend(margin.float().cpu().tolist())
                 component_rewards["retrieval_top1"].extend(top1.cpu().tolist())
@@ -243,4 +320,5 @@ class CLAPSpec(BaseRewardComponentSpec):
     device: str = "auto"
     model_id: str = "laion/larger_clap_general"
     prompt_metadata_key: Optional[str] = None
+    negative_prompts_metadata_key: Optional[str] = None
     retrieval_prompts: List[str] = field(default_factory=list)

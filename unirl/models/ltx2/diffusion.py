@@ -74,10 +74,13 @@ def _combine_modality_logp(
     audio_logp: torch.Tensor,
     n_video: int,
     n_audio: int,
+    audio_weight: Optional[float] = None,
 ) -> torch.Tensor:
-    """Element-weighted mean of the per-step video/audio log-probs."""
-    total = n_video + n_audio
-    return (video_logp * n_video + audio_logp * n_audio) / total
+    """Combine per-step video/audio mean log-probs using element or explicit modality weighting."""
+    if audio_weight is None:
+        total = n_video + n_audio
+        return (video_logp * n_video + audio_logp * n_audio) / total
+    return video_logp * (1.0 - audio_weight) + audio_logp * audio_weight
 
 
 class LTX2DiffusionStep(DiffusionStep[LTX2Bundle, LTX2Conditions]):
@@ -183,6 +186,7 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
         trajectory_precision: str = "fp16",
         logprob_precision: str = "fp32",
         audio_joint_sde: bool = True,
+        audio_policy_logp_weight: Optional[float] = None,
     ) -> None:
         self.bundle = bundle
         self.step_kernel = LTX2DiffusionStep()
@@ -191,6 +195,11 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
         self.audio_joint_sde = bool(audio_joint_sde)
+        if audio_policy_logp_weight is not None:
+            audio_policy_logp_weight = float(audio_policy_logp_weight)
+            if not 0.0 <= audio_policy_logp_weight <= 1.0:
+                raise ValueError(f"audio_policy_logp_weight must be in [0, 1], got {audio_policy_logp_weight}.")
+        self.audio_policy_logp_weight = audio_policy_logp_weight
         self._audio_in_policy = self.audio_joint_sde and bool(getattr(bundle, "has_audio", False))
 
     def trainable_module(self) -> torch.nn.Module:
@@ -332,6 +341,7 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
                             audio_log_prob,
                             n_video=x[0].numel(),
                             n_audio=a[0].numel(),
+                            audio_weight=self.audio_policy_logp_weight,
                         )
                     sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
 
@@ -451,6 +461,7 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
                         audio_log_prob,
                         n_video=sample[0].numel(),
                         n_audio=audio_sample[0].numel(),
+                        audio_weight=self.audio_policy_logp_weight,
                     )
                     if prev_mean is not None and audio_prev_mean is not None:
                         prev_mean = torch.cat([prev_mean, audio_prev_mean], dim=1)

@@ -50,6 +50,7 @@ bundle:
     max_sequence_length: 512
     enable_audio: true
     audio_joint_sde: true
+    audio_policy_logp_weight: 1.0
     default_height: 512
     default_width: 768
     default_num_frames: 49
@@ -83,9 +84,9 @@ backend:
     weight_decay: 0.0
   scheduler_cfg:
     _target_: unirl.train.backend.base.LrSchedulerConfig
-    type: cosine
+    type: constant
     warmup_steps: 0
-    total_steps: 200
+    total_steps: 10000
   lora_cfg:
     _target_: unirl.train.configs.LoraConfig
     rank: 32
@@ -126,6 +127,8 @@ reward:
       batch_size: 2
       device: auto
       negative_prompts_metadata_key: negative_audio_captions
+      matched_cosine_weight: 1.0
+      retrieval_margin_weight: 1.0
 
 algorithm:
   _target_: unirl.algorithms.flowgrpo.FlowGRPO
@@ -163,7 +166,7 @@ sampling:
   width: 384
   num_frames: 49
   eta: 0.7
-  samples_per_prompt: 4
+  samples_per_prompt: 8
   seed: 42
   init_same_noise: false
   autocast_precision: bf16

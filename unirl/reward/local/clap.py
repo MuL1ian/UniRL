@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -27,6 +28,14 @@ class CLAPRewardScorer(LocalRewardBackend):
     def __init__(self, *, config: "CLAPSpec", base_device: str) -> None:
         self.prompt_metadata_key = str(config.prompt_metadata_key or "").strip() or None
         self.negative_prompts_metadata_key = str(config.negative_prompts_metadata_key or "").strip() or None
+        self.matched_cosine_weight = float(config.matched_cosine_weight)
+        self.retrieval_margin_weight = float(config.retrieval_margin_weight)
+        if not math.isfinite(self.matched_cosine_weight) or not math.isfinite(self.retrieval_margin_weight):
+            raise ValueError("CLAP reward weights must be finite.")
+        if self.matched_cosine_weight < 0.0 or self.retrieval_margin_weight < 0.0:
+            raise ValueError("CLAP reward weights must be non-negative.")
+        if self.matched_cosine_weight == 0.0 and self.retrieval_margin_weight == 0.0:
+            raise ValueError("At least one CLAP reward weight must be positive.")
         self.retrieval_prompts = [str(prompt).strip() for prompt in config.retrieval_prompts]
         if any(not prompt for prompt in self.retrieval_prompts):
             raise ValueError("CLAPSpec.retrieval_prompts must contain only non-empty strings.")
@@ -36,6 +45,10 @@ class CLAPRewardScorer(LocalRewardBackend):
             raise ValueError("CLAPSpec.retrieval_prompts needs at least two prompts for retrieval diagnostics.")
         if self.retrieval_prompts and self.negative_prompts_metadata_key:
             raise ValueError("CLAPSpec.retrieval_prompts and negative_prompts_metadata_key are mutually exclusive.")
+        if self.retrieval_margin_weight > 0.0 and not (self.retrieval_prompts or self.negative_prompts_metadata_key):
+            raise ValueError(
+                "CLAPSpec.retrieval_margin_weight requires retrieval_prompts or negative_prompts_metadata_key."
+            )
         self._retrieval_text_embeds: Optional[torch.Tensor] = None
         super().__init__(
             device=resolve_device(config.device, base_device),
@@ -290,8 +303,12 @@ class CLAPRewardScorer(LocalRewardBackend):
                 component_rewards["retrieval_margin"].extend(margin.float().cpu().tolist())
                 component_rewards["retrieval_top1"].extend(top1.cpu().tolist())
 
+            reward = matched * self.matched_cosine_weight
+            if self.retrieval_margin_weight > 0.0:
+                reward = reward + margin * self.retrieval_margin_weight
+
             matched_values = matched.float().cpu().tolist()
-            all_rewards.extend(matched_values)
+            all_rewards.extend(reward.float().cpu().tolist())
             component_rewards["matched_cosine"].extend(matched_values)
 
         return all_rewards, component_rewards
@@ -322,3 +339,5 @@ class CLAPSpec(BaseRewardComponentSpec):
     prompt_metadata_key: Optional[str] = None
     negative_prompts_metadata_key: Optional[str] = None
     retrieval_prompts: List[str] = field(default_factory=list)
+    matched_cosine_weight: float = 1.0
+    retrieval_margin_weight: float = 0.0

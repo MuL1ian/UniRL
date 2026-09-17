@@ -11,7 +11,6 @@ import random
 import urllib.request
 from typing import Dict, Iterable, List
 
-
 DEFAULT_SOURCE = "https://raw.githubusercontent.com/cdjkim/audiocaps/d004db3ea1b01cf4fd0347dd8d27db90cadc8809"
 
 

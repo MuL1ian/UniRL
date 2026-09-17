@@ -85,7 +85,6 @@ def _write_split(
         for index, row in enumerate(rows):
             caption = row["caption"].strip()
             metadata = {
-                "audio_caption": caption,
                 "negative_audio_captions": _negative_captions(
                     rows,
                     index,

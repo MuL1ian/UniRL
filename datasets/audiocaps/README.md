@@ -40,7 +40,6 @@ Each row uses the original AudioCaps caption as both the generation prompt and C
 {
   "prompt": "Multiple clanging and clanking sounds",
   "metadata": {
-    "audio_caption": "Multiple clanging and clanking sounds",
     "negative_audio_captions": ["... seven captions from other rows ..."],
     "audiocap_id": "58146",
     "source_dataset": "AudioCaps",
@@ -48,6 +47,9 @@ Each row uses the original AudioCaps caption as both the generation prompt and C
   }
 }
 ```
+
+The CLAP scorer reads the positive text directly from `prompt`; no separate
+audio-caption field or hand-written rewrite is required for this dataset.
 
 The deterministic negative captions are diagnostics only. The optimized reward remains the
 matched CLAP cosine. They let the run report mismatched cosine, hardest-negative margin, and

@@ -79,7 +79,7 @@ backend:
     weight_decay: 0.0
   scheduler_cfg:
     _target_: unirl.train.backend.base.LrSchedulerConfig
-    type: constant
+    type: cosine
     warmup_steps: 0
     total_steps: 200
   lora_cfg:

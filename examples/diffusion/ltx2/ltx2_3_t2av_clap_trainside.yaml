@@ -22,7 +22,9 @@ eval_interval: 10
 eval_num_prompts: 32
 eval_samples_per_prompt: 4
 eval_chunk_prompts: 8
-eval_eta: 0.7
+eval_eta: 0.0
+eval_sampling:
+  init_same_noise: false
 save_interval: 20
 save_dir: ${oc.env:SAVE_DIR,checkpoints/ltx2_3_t2av_clap_trainside}
 save_mode: adapter

@@ -32,7 +32,14 @@ class CLAPRewardScorer(LocalRewardBackend):
         self.matched_cosine_weight = float(config.matched_cosine_weight)
         self.retrieval_margin_weight = float(config.retrieval_margin_weight)
         self.event_coverage_weight = float(config.event_coverage_weight)
-        reward_weights = (self.matched_cosine_weight, self.retrieval_margin_weight, self.event_coverage_weight)
+        self.ast_event_weight = float(config.ast_event_weight)
+        self.ast_model_id = str(config.ast_model_id).strip()
+        reward_weights = (
+            self.matched_cosine_weight,
+            self.retrieval_margin_weight,
+            self.event_coverage_weight,
+            self.ast_event_weight,
+        )
         if not all(math.isfinite(weight) for weight in reward_weights):
             raise ValueError("CLAP reward weights must be finite.")
         if any(weight < 0.0 for weight in reward_weights):
@@ -63,7 +70,15 @@ class CLAPRewardScorer(LocalRewardBackend):
             )
         if self.event_coverage_weight > 0.0 and not self.event_prompts_metadata_key:
             raise ValueError("CLAPSpec.event_coverage_weight requires event_prompts_metadata_key.")
+        if self.ast_event_weight > 0.0 and not self.event_prompts_metadata_key:
+            raise ValueError("CLAPSpec.ast_event_weight requires event_prompts_metadata_key.")
+        if self.ast_event_weight > 0.0 and not self.ast_model_id:
+            raise ValueError("CLAPSpec.ast_model_id must be non-empty when ast_event_weight is positive.")
         self._retrieval_text_embeds: Optional[torch.Tensor] = None
+        self.ast_model = None
+        self.ast_processor = None
+        self._ast_sample_rate: Optional[int] = None
+        self._ast_label_to_index: Dict[str, int] = {}
         super().__init__(
             device=resolve_device(config.device, base_device),
             batch_size=config.batch_size,
@@ -83,6 +98,26 @@ class CLAPRewardScorer(LocalRewardBackend):
         self._processor_audio_keyword = (
             "audio" if "audio" in inspect.signature(self.processor.__call__).parameters else "audios"
         )
+        if self.ast_event_weight > 0.0:
+            try:
+                from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
+            except ImportError as e:
+                raise ImportError(
+                    "transformers with AutoModelForAudioClassification is required for the AST event reward"
+                ) from e
+
+            self.ast_processor = AutoFeatureExtractor.from_pretrained(self.ast_model_id)
+            self.ast_model = (
+                AutoModelForAudioClassification.from_pretrained(self.ast_model_id)
+                .to(self.device)
+                .eval()
+                .to(dtype=torch.float32)
+            )
+            self._ast_sample_rate = int(self.ast_processor.sampling_rate)
+            self._ast_label_to_index = {
+                str(label).strip().lower(): int(index)
+                for index, label in self.ast_model.config.id2label.items()
+            }
 
     def _preprocess_audio(self, audio_list: List[torch.Tensor], src_sample_rate: int) -> List["torch.Tensor"]:
         """Downmix and resample each ``[L]`` / ``[C, L]`` / ``[L, C]`` waveform to CLAP's 48 kHz mono ``[L']``."""
@@ -157,6 +192,67 @@ class CLAPRewardScorer(LocalRewardBackend):
                 attention_mask=inputs.get("attention_mask"),
             )
         return F.normalize(self._feature_tensor(features).float(), p=2, dim=-1)
+
+    def _encode_ast_events(
+        self,
+        waveforms: List[torch.Tensor],
+        src_sample_rate: int,
+        event_prompts: List[List[str]],
+    ) -> torch.Tensor:
+        """Return the minimum AudioSet event probability requested by each sample."""
+        if self.ast_model is None or self.ast_processor is None or self._ast_sample_rate is None:
+            raise RuntimeError("AST event reward is enabled but the AST model is not loaded.")
+
+        import numpy as np
+        import torchaudio.functional as AF
+
+        processed: List[np.ndarray] = []
+        for waveform in waveforms:
+            wf = waveform.detach().float()
+            if wf.isnan().any() or wf.isinf().any():
+                wf = torch.zeros_like(wf)
+            if wf.ndim == 2:
+                channel_axis = 0 if wf.shape[0] <= wf.shape[1] else 1
+                wf = wf.mean(dim=channel_axis)
+            wf = wf.reshape(-1)
+            if src_sample_rate != self._ast_sample_rate:
+                wf = AF.resample(
+                    wf.unsqueeze(0),
+                    orig_freq=int(src_sample_rate),
+                    new_freq=self._ast_sample_rate,
+                ).squeeze(0)
+            if self.audio_normalization == "rms":
+                rms = wf.square().mean().sqrt()
+                peak = wf.abs().max()
+                if rms > torch.finfo(wf.dtype).eps:
+                    gain = (10.0 ** (self.target_rms_dbfs / 20.0)) / rms
+                    if peak * gain > self.peak_limit:
+                        gain = self.peak_limit / peak
+                    wf = wf * gain
+            processed.append(wf.cpu().numpy())
+
+        inputs = self.ast_processor(
+            processed,
+            sampling_rate=self._ast_sample_rate,
+            return_tensors="pt",
+            padding=True,
+        )
+        inputs = {key: value.to(self.device) for key, value in inputs.items()}
+        with torch.no_grad():
+            probabilities = self.ast_model(**inputs).logits.float().sigmoid()
+
+        scores = []
+        for row_index, labels in enumerate(event_prompts):
+            missing = [label for label in labels if label.strip().lower() not in self._ast_label_to_index]
+            if missing:
+                raise ValueError(f"AST model does not define AudioSet event labels: {missing!r}.")
+            indices = torch.tensor(
+                [self._ast_label_to_index[label.strip().lower()] for label in labels],
+                device=probabilities.device,
+                dtype=torch.long,
+            )
+            scores.append(probabilities[row_index].index_select(0, indices).min())
+        return torch.stack(scores)
 
     def _reward_prompts(self, request: RewardRequest) -> List[str]:
         prompts = request.prompts
@@ -290,6 +386,8 @@ class CLAPRewardScorer(LocalRewardBackend):
             )
         if event_prompt_sets is not None:
             component_rewards["event_coverage_min_cosine"] = []
+        if self.ast_event_weight > 0.0:
+            component_rewards["ast_event_min_probability"] = []
         if self.retrieval_prompts:
             unknown = sorted(set(prompts) - set(retrieval_prompt_to_index))
             if unknown:
@@ -369,6 +467,16 @@ class CLAPRewardScorer(LocalRewardBackend):
                 event_coverage = torch.stack(event_values)
                 component_rewards["event_coverage_min_cosine"].extend(event_coverage.float().cpu().tolist())
 
+            ast_event_score: Optional[torch.Tensor] = None
+            if self.ast_event_weight > 0.0:
+                assert event_prompt_sets is not None
+                ast_event_score = self._encode_ast_events(
+                    batch_audio,
+                    src_rate,
+                    event_prompt_sets[i : i + self.batch_size],
+                )
+                component_rewards["ast_event_min_probability"].extend(ast_event_score.float().cpu().tolist())
+
             if self.retrieval_prompts or negative_prompt_sets is not None:
                 component_rewards["mismatched_cosine"].extend(mismatched.float().cpu().tolist())
                 component_rewards["retrieval_margin"].extend(margin.float().cpu().tolist())
@@ -380,6 +488,9 @@ class CLAPRewardScorer(LocalRewardBackend):
             if self.event_coverage_weight > 0.0:
                 assert event_coverage is not None
                 reward = reward + event_coverage * self.event_coverage_weight
+            if self.ast_event_weight > 0.0:
+                assert ast_event_score is not None
+                reward = reward + ast_event_score * self.ast_event_weight
 
             matched_values = matched.float().cpu().tolist()
             all_rewards.extend(reward.float().cpu().tolist())
@@ -394,11 +505,15 @@ class CLAPRewardScorer(LocalRewardBackend):
 
     def offload(self) -> None:
         super().offload()
+        if self.ast_model is not None:
+            self.ast_model = self.ast_model.cpu()
         if self._retrieval_text_embeds is not None:
             self._retrieval_text_embeds = self._retrieval_text_embeds.cpu()
 
     def onload(self) -> None:
         super().onload()
+        if self.ast_model is not None:
+            self.ast_model = self.ast_model.to(self.device)
         if self._retrieval_text_embeds is not None:
             self._retrieval_text_embeds = self._retrieval_text_embeds.to(self.device)
 
@@ -417,6 +532,8 @@ class CLAPSpec(BaseRewardComponentSpec):
     matched_cosine_weight: float = 1.0
     retrieval_margin_weight: float = 0.0
     event_coverage_weight: float = 0.0
+    ast_event_weight: float = 0.0
+    ast_model_id: str = "MIT/ast-finetuned-audioset-10-10-0.4593"
     audio_normalization: str = "none"
     target_rms_dbfs: float = -20.0
     peak_limit: float = 0.95

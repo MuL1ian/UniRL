@@ -28,14 +28,26 @@ class CLAPRewardScorer(LocalRewardBackend):
     def __init__(self, *, config: "CLAPSpec", base_device: str) -> None:
         self.prompt_metadata_key = str(config.prompt_metadata_key or "").strip() or None
         self.negative_prompts_metadata_key = str(config.negative_prompts_metadata_key or "").strip() or None
+        self.event_prompts_metadata_key = str(config.event_prompts_metadata_key or "").strip() or None
         self.matched_cosine_weight = float(config.matched_cosine_weight)
         self.retrieval_margin_weight = float(config.retrieval_margin_weight)
-        if not math.isfinite(self.matched_cosine_weight) or not math.isfinite(self.retrieval_margin_weight):
+        self.event_coverage_weight = float(config.event_coverage_weight)
+        reward_weights = (self.matched_cosine_weight, self.retrieval_margin_weight, self.event_coverage_weight)
+        if not all(math.isfinite(weight) for weight in reward_weights):
             raise ValueError("CLAP reward weights must be finite.")
-        if self.matched_cosine_weight < 0.0 or self.retrieval_margin_weight < 0.0:
+        if any(weight < 0.0 for weight in reward_weights):
             raise ValueError("CLAP reward weights must be non-negative.")
-        if self.matched_cosine_weight == 0.0 and self.retrieval_margin_weight == 0.0:
+        if not any(weight > 0.0 for weight in reward_weights):
             raise ValueError("At least one CLAP reward weight must be positive.")
+        self.audio_normalization = str(config.audio_normalization).strip().lower()
+        self.target_rms_dbfs = float(config.target_rms_dbfs)
+        self.peak_limit = float(config.peak_limit)
+        if self.audio_normalization not in {"none", "rms"}:
+            raise ValueError("CLAPSpec.audio_normalization must be 'none' or 'rms'.")
+        if not math.isfinite(self.target_rms_dbfs) or self.target_rms_dbfs > 0.0:
+            raise ValueError("CLAPSpec.target_rms_dbfs must be finite and at most 0 dBFS.")
+        if not math.isfinite(self.peak_limit) or not 0.0 < self.peak_limit <= 1.0:
+            raise ValueError("CLAPSpec.peak_limit must be in (0, 1].")
         self.retrieval_prompts = [str(prompt).strip() for prompt in config.retrieval_prompts]
         if any(not prompt for prompt in self.retrieval_prompts):
             raise ValueError("CLAPSpec.retrieval_prompts must contain only non-empty strings.")
@@ -49,6 +61,8 @@ class CLAPRewardScorer(LocalRewardBackend):
             raise ValueError(
                 "CLAPSpec.retrieval_margin_weight requires retrieval_prompts or negative_prompts_metadata_key."
             )
+        if self.event_coverage_weight > 0.0 and not self.event_prompts_metadata_key:
+            raise ValueError("CLAPSpec.event_coverage_weight requires event_prompts_metadata_key.")
         self._retrieval_text_embeds: Optional[torch.Tensor] = None
         super().__init__(
             device=resolve_device(config.device, base_device),
@@ -92,6 +106,15 @@ class CLAPRewardScorer(LocalRewardBackend):
                     orig_freq=int(src_sample_rate),
                     new_freq=self.CLAP_SAMPLE_RATE,
                 ).squeeze(0)
+
+            if self.audio_normalization == "rms":
+                rms = wf.square().mean().sqrt()
+                peak = wf.abs().max()
+                if rms > torch.finfo(wf.dtype).eps:
+                    gain = (10.0 ** (self.target_rms_dbfs / 20.0)) / rms
+                    if peak * gain > self.peak_limit:
+                        gain = self.peak_limit / peak
+                    wf = wf * gain
 
             processed.append(wf.cpu().numpy())
         return processed
@@ -177,6 +200,34 @@ class CLAPRewardScorer(LocalRewardBackend):
             resolved.append(negatives)
         return resolved
 
+    def _event_prompts(self, request: RewardRequest) -> Optional[List[List[str]]]:
+        """Resolve per-sample sound-event prompts used for minimum-coverage scoring."""
+        if self.event_prompts_metadata_key is None:
+            return None
+
+        metadata = request.metadata or []
+        resolved: List[List[str]] = []
+        for index in range(len(request.prompts)):
+            row = metadata[index] if index < len(metadata) else None
+            candidates = row.get(self.event_prompts_metadata_key) if isinstance(row, dict) else None
+            if not isinstance(candidates, (list, tuple)):
+                raise ValueError(
+                    "CLAP event prompt metadata must be a list of strings; "
+                    f"key={self.event_prompts_metadata_key!r}, sample_index={index}."
+                )
+            event_prompts = list(
+                dict.fromkeys(
+                    candidate.strip() for candidate in candidates if isinstance(candidate, str) and candidate.strip()
+                )
+            )
+            if not event_prompts:
+                raise ValueError(
+                    "CLAP event prompt metadata must contain at least one event; "
+                    f"key={self.event_prompts_metadata_key!r}, sample_index={index}."
+                )
+            resolved.append(event_prompts)
+        return resolved
+
     def compute_rewards(self, request: RewardRequest) -> RewardResponse:
         """Score matched captions and expose optional retrieval diagnostics."""
         if not self._is_loaded:
@@ -213,12 +264,15 @@ class CLAPRewardScorer(LocalRewardBackend):
             raise ValueError(f"CLAPRewardScorer got {len(audio)} audio samples but {len(prompts)} reward prompts.")
         src_rate = int(request.audio_sample_rate)
         negative_prompt_sets = self._negative_prompts(request, prompts)
+        event_prompt_sets = self._event_prompts(request)
         dynamic_text_embeds: Optional[torch.Tensor] = None
         dynamic_prompt_to_index: Dict[str, int] = {}
-        if not self.retrieval_prompts:
-            dynamic_prompts = list(prompts)
+        if not self.retrieval_prompts or event_prompt_sets is not None:
+            dynamic_prompts = [] if self.retrieval_prompts else list(prompts)
             if negative_prompt_sets is not None:
                 dynamic_prompts.extend(prompt for row in negative_prompt_sets for prompt in row)
+            if event_prompt_sets is not None:
+                dynamic_prompts.extend(prompt for row in event_prompt_sets for prompt in row)
             unique_dynamic_prompts = list(dict.fromkeys(dynamic_prompts))
             dynamic_text_embeds = self._encode_texts(unique_dynamic_prompts)
             dynamic_prompt_to_index = {prompt: index for index, prompt in enumerate(unique_dynamic_prompts)}
@@ -234,6 +288,8 @@ class CLAPRewardScorer(LocalRewardBackend):
                     "retrieval_top1": [],
                 }
             )
+        if event_prompt_sets is not None:
+            component_rewards["event_coverage_min_cosine"] = []
         if self.retrieval_prompts:
             unknown = sorted(set(prompts) - set(retrieval_prompt_to_index))
             if unknown:
@@ -298,6 +354,21 @@ class CLAPRewardScorer(LocalRewardBackend):
                 text_embeds = dynamic_text_embeds.index_select(0, target_indices)
                 matched = (audio_embeds * text_embeds).sum(dim=-1)
 
+            event_coverage: Optional[torch.Tensor] = None
+            if event_prompt_sets is not None:
+                assert dynamic_text_embeds is not None
+                event_values = []
+                for row_index, row_prompts in enumerate(event_prompt_sets[i : i + self.batch_size]):
+                    indices = torch.tensor(
+                        [dynamic_prompt_to_index[prompt] for prompt in row_prompts],
+                        device=dynamic_text_embeds.device,
+                        dtype=torch.long,
+                    )
+                    row_event_embeds = dynamic_text_embeds.index_select(0, indices)
+                    event_values.append((row_event_embeds @ audio_embeds[row_index]).min())
+                event_coverage = torch.stack(event_values)
+                component_rewards["event_coverage_min_cosine"].extend(event_coverage.float().cpu().tolist())
+
             if self.retrieval_prompts or negative_prompt_sets is not None:
                 component_rewards["mismatched_cosine"].extend(mismatched.float().cpu().tolist())
                 component_rewards["retrieval_margin"].extend(margin.float().cpu().tolist())
@@ -306,6 +377,9 @@ class CLAPRewardScorer(LocalRewardBackend):
             reward = matched * self.matched_cosine_weight
             if self.retrieval_margin_weight > 0.0:
                 reward = reward + margin * self.retrieval_margin_weight
+            if self.event_coverage_weight > 0.0:
+                assert event_coverage is not None
+                reward = reward + event_coverage * self.event_coverage_weight
 
             matched_values = matched.float().cpu().tolist()
             all_rewards.extend(reward.float().cpu().tolist())
@@ -338,6 +412,11 @@ class CLAPSpec(BaseRewardComponentSpec):
     model_id: str = "laion/larger_clap_general"
     prompt_metadata_key: Optional[str] = None
     negative_prompts_metadata_key: Optional[str] = None
+    event_prompts_metadata_key: Optional[str] = None
     retrieval_prompts: List[str] = field(default_factory=list)
     matched_cosine_weight: float = 1.0
     retrieval_margin_weight: float = 0.0
+    event_coverage_weight: float = 0.0
+    audio_normalization: str = "none"
+    target_rms_dbfs: float = -20.0
+    peak_limit: float = 0.95

@@ -204,8 +204,6 @@ class CLAPRewardScorer(LocalRewardBackend):
             raise RuntimeError("AST event reward is enabled but the AST model is not loaded.")
 
         import numpy as np
-        import torchaudio.functional as AF
-
         processed: List[np.ndarray] = []
         for waveform in waveforms:
             wf = waveform.detach().float()
@@ -216,11 +214,21 @@ class CLAPRewardScorer(LocalRewardBackend):
                 wf = wf.mean(dim=channel_axis)
             wf = wf.reshape(-1)
             if src_sample_rate != self._ast_sample_rate:
-                wf = AF.resample(
-                    wf.unsqueeze(0),
-                    orig_freq=int(src_sample_rate),
-                    new_freq=self._ast_sample_rate,
-                ).squeeze(0)
+                if src_sample_rate % self._ast_sample_rate == 0:
+                    factor = src_sample_rate // self._ast_sample_rate
+                    wf = F.avg_pool1d(
+                        wf.reshape(1, 1, -1),
+                        kernel_size=factor,
+                        stride=factor,
+                    ).reshape(-1)
+                else:
+                    target_length = max(1, round(wf.numel() * self._ast_sample_rate / src_sample_rate))
+                    wf = F.interpolate(
+                        wf.reshape(1, 1, -1),
+                        size=target_length,
+                        mode="linear",
+                        align_corners=False,
+                    ).reshape(-1)
             if self.audio_normalization == "rms":
                 rms = wf.square().mean().sqrt()
                 peak = wf.abs().max()

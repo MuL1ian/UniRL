@@ -265,7 +265,7 @@ class LTX2Pipeline(Pipeline):
             audio_sample_rate = int(self.bundle.vocoder.config.output_sampling_rate)
 
         primitives = {"video": decoded}
-        primitive_metadata = {}
+        primitive_metadata = {"video": {"fps": float(self.config.default_frame_rate)}}
         if decoded_audio is not None:
             primitives["audio"] = decoded_audio
             primitive_metadata["audio"] = {"sample_rate": audio_sample_rate}

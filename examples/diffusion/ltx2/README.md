@@ -157,3 +157,49 @@ The small recipe uses `LTX_VERL_SAVE_DIR`; the high-batch recipe uses
 `LTX_CLAP_HIGHBATCH_SAVE_DIR`. Use separate directories for independent runs.
 Existing running processes retain the code and reward objects loaded at startup;
 this cleanup applies on the next launch and does not restart active runs.
+
+## AudioCaps with normalized event-grounded CLAP
+
+`ltx2_3_t2av_verl_cps_clap_audiocaps_events_300.yaml` inherits the small CPS
+recipe above: 8 prompts x 8 samples, global optimizer batch 32, training
+micro-batch 2, rollout forward batch 2, and 150 rollouts / 300 updates.
+Sampling, LoRA, optimizer, joint AV policy, and sparse CPS indices are unchanged.
+It starts from the base model and disables baseline and periodic evaluation.
+
+The input is the original AudioCaps caption, without a visual prompt wrapper.
+For example, `A woman talks nearby as water pours` has the official AudioSet
+labels `Water tap, faucet` and `Speech`. Join labels by YouTube ID and segment
+start time with the converter:
+
+```bash
+python datasets/audiocaps/prepare_audiocaps.py \
+  --source /path/to/audiocaps-csvs \
+  --out-dir data/audiocaps_events \
+  --audioset-metadata-dir /path/to/audioset-metadata \
+  --eval-limit 64
+bash examples/run_experiment_single_node.sh diffusion/ltx2/ltx2_3_t2av_verl_cps_clap_audiocaps_events_300
+```
+
+The prepared train split contains 49,838 unique segments. The 64 validation
+records are available for later checks; this recipe never evaluates them.
+`LTX_AUDIOCAPS_DATA_PATH` overrides the training JSONL and
+`LTX_AUDIOCAPS_SAVE_DIR` chooses a separate adapter checkpoint directory.
+
+CLAP receives mono 48 kHz audio normalized toward -20 dBFS RMS, with gain
+limited to a peak of 0.95. The train reward is matched-caption cosine plus
+the minimum cosine over that clip's AudioSet event labels, each weighted 1.
+Both terms use the same CLAP model; ImageBind, AST, and retrieval-margin
+rewards are absent. Normalization affects reward input, not saved audio.
+
+Track `rollout/reward_matched_cosine_mean` and
+`rollout/reward_event_coverage_min_cosine_mean` alongside `rollout/reward_mean`.
+The sum has a different scale from the original CLAP-only reward; changes in
+dataset and normalization also prevent an apples-to-apples comparison of
+matched cosine with the old VidProM run. Training reward alone does not
+establish held-out performance.
+
+This branch includes upstream commits `a53cdf7` (CLAP normalization/events),
+`a883c6f` (video FPS metadata), and `6121875` (standard AudioCaps recipe tuning).
+The FPS integration uses `primitive_metadata["video"]["fps"]` and
+`MediaPreview.video_fps`. The standard recipe's denoising/evaluation settings
+do not override this experiment's inherited small CPS configuration.

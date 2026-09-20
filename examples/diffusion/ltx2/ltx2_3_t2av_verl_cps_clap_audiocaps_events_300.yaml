@@ -1,0 +1,32 @@
+# @package _global_
+# AudioCaps + normalized event-grounded CLAP, using the established small CPS batch.
+
+defaults:
+  - ltx2_3_t2av_verl_cps_clap_only_300
+  - _self_
+
+load_dir: null
+eval_interval: 0
+save_dir: ${oc.env:LTX_AUDIOCAPS_SAVE_DIR,checkpoints/ltx23_verl_clap_audiocaps_events}
+
+logging:
+  run_name: ${oc.env:WANDB_RUN_NAME,ltx23-ac-clap1evt1-rms20-p8g8-mb2-n24-cfg4-cps08-sde3-lr3e4-r64a128-f81-u300-noeval}
+  tags: [ltx2.3, verl-reference, cps, clap-only, audiocaps, event-grounded, rms-normalized, joint-av, noeval]
+
+data_source:
+  args:
+    run:
+      data_path: ${oc.env:LTX_AUDIOCAPS_DATA_PATH,data/audiocaps_events/train.jsonl}
+      eval_data_path: null
+
+reward:
+  backend:
+    config:
+      matched_cosine_weight: 1.0
+      retrieval_margin_weight: 0.0
+      negative_prompts_metadata_key: null
+      event_prompts_metadata_key: audio_event_labels
+      event_coverage_weight: 1.0
+      audio_normalization: rms
+      target_rms_dbfs: -20.0
+      peak_limit: 0.95

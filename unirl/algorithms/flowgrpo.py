@@ -35,6 +35,7 @@ class FlowGRPOConfig(BaseAlgorithmConfig):
     clip_range: float = 1e-4
     clip_schedule: str = "constant"
     beta: float = 0.0
+    adv_clip_max: Optional[float] = None
     old_logp_source: str = "rollout"
     params: Any = dc_field(default=None)
 
@@ -60,6 +61,7 @@ class FlowGRPO(StageAlgorithm):
         clip_range: float = 1e-4,
         clip_schedule: str = "constant",
         beta: float = 0.0,
+        adv_clip_max: Optional[float] = None,
         old_logp_source: str = "rollout",
         backend: Any = None,
         conditions_cls: Optional[Type[Any]] = None,
@@ -74,6 +76,11 @@ class FlowGRPO(StageAlgorithm):
         self.clip_range = float(clip_range)
         self.clip_schedule = str(clip_schedule)
         self.beta = float(beta)
+        self.adv_clip_max = None if adv_clip_max is None else float(adv_clip_max)
+        require(
+            self.adv_clip_max is None or 0.0 < self.adv_clip_max < float("inf"),
+            "FlowGRPO: adv_clip_max must be finite and positive",
+        )
         self._ref_model = _resolve_reference_model(backend, beta=self.beta, algo="FlowGRPO")
         self.old_logp_source = str(old_logp_source).strip().lower()
         require(
@@ -139,6 +146,9 @@ class FlowGRPO(StageAlgorithm):
 
         clip_range = _resolve_clip_range_from_schedule(self.clip_range, self.clip_schedule, training_progress)
         adv_b = advantages.detach().to(dtype=new_logp.dtype, device=new_logp.device).reshape(-1, 1).expand_as(new_logp)
+
+        if self.adv_clip_max is not None:
+            adv_b = adv_b.clamp(-self.adv_clip_max, self.adv_clip_max)
 
         loss_per_elem, ratio_metrics = _grpo_clip_loss(
             new_logp=new_logp,

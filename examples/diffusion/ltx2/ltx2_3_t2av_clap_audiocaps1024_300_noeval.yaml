@@ -1,0 +1,19 @@
+# @package _global_
+# Fresh run: 150 rollouts x 2 optimizer updates = 300 steps, with evaluation disabled.
+
+defaults:
+  - ltx2_3_t2av_clap_audiocaps1024_300
+  - _self_
+
+eval_interval: 0
+load_dir: null
+save_dir: ${oc.env:LTX_AUDIO_SAVE_DIR,checkpoints/ltx2_3_clap_ac1024_u300_noeval}
+
+logging:
+  run_name: ${oc.env:WANDB_RUN_NAME,ltx23-clap-ac1024-noeval-u300-n30-cfg3-eta03-sde2-lr1e4-r32a256-g8-f121-bf16}
+  tags: [ltx2.3, audio, clap, audiocaps1024, noeval, updates300, cfg3, bf16-master]
+
+data_source:
+  args:
+    run:
+      eval_data_path: null

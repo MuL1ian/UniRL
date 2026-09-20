@@ -22,7 +22,7 @@ from .config import (
     LTX2_TEMPORAL_COMPRESSION,
     LTX2PipelineConfig,
 )
-from .diffusion import LTX2DiffusionStage, audio_latent_shape
+from .diffusion import _LTX2_FRAME_RATE, LTX2DiffusionStage, audio_latent_shape
 from .schedule import build_ltx2_schedule_policy
 from .text_embed import LTX2TextEmbedStage
 from .vae import LTX2AudioDecodeStage, LTX2VAEDecodeStage, LTX2VAEEncodeStage
@@ -249,7 +249,7 @@ class LTX2Pipeline(Pipeline):
         decoded_audio = None
         audio_sample_rate = None
         if self.audio_decode is not None and segment.aux_latents is not None:
-            from .diffusion import _LTX2_FRAME_RATE, _audio_num_frames
+            from .diffusion import _audio_num_frames
 
             audio_t = _audio_num_frames(int(params.num_frames), _LTX2_FRAME_RATE)
             final_audio = segment.aux_latents_at(int(params.num_inference_steps))

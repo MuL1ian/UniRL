@@ -25,6 +25,7 @@ class MediaPreview(Batch):
     audio_sample_rate: Optional[int] = None
     prompts: List[str] = concat_field(default_factory=list)
     rewards: List[float] = concat_field(default_factory=list)
+    video_frame_rate: Optional[float] = None
 
     def __post_init__(self) -> None:
         n = len(self.images) if self.images else len(self.videos)
@@ -192,6 +193,7 @@ def build_media_preview_for_part(
         audio_sample_rate=int(audio_sr) if audio_sr is not None else None,
         prompts=prompts_out,
         rewards=reward_values,
+        video_frame_rate=part.primitive_metadata.get("video", {}).get("frame_rate"),
     )
 
 
